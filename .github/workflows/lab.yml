@@ -5,6 +5,11 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      deploy_temporary_lab:
+        description: Create and destroy a temporary lab (requires an unused management subnet)
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -64,7 +69,10 @@ jobs:
 
   lab:
     needs: build
-    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    if: >-
+      github.ref == 'refs/heads/main' &&
+      github.event_name == 'workflow_dispatch' &&
+      inputs.deploy_temporary_lab
     runs-on: [self-hosted, linux, x64, containerlab]
     environment: containerlab
     concurrency:

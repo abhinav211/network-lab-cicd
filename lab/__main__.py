@@ -7,9 +7,9 @@ from lab.model import load_hosts
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Build and verify an ephemeral cEOS BGP lab")
+    parser = argparse.ArgumentParser(description="Build, configure and verify a cEOS BGP lab")
     parser.add_argument(
-        "command", choices=["validate", "build", "prepare", "wait", "configure", "verify"]
+        "command", choices=["validate", "build", "prepare", "wait", "configure", "verify", "save"]
     )
     parser.add_argument("--root", type=Path, default=Path.cwd())
     parser.add_argument("--output", type=Path, default=Path("build"))

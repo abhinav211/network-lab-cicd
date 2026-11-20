@@ -12,18 +12,39 @@ TEST: lint, type-check, unit tests, inventory/topology validation
     v
 BUILD: Jinja2 -> one EOS configuration per host + SHA256SUMS artifact
     |
-    v  main only, protected environment, dedicated self-hosted runner
-DEPLOY: Containerlab -> wait for NAPALM facts -> merge built configurations
+    +-- main push -> Deploy to existing lab
+    |                 |
+    |                 v
+    |               Required approval (existing-lab environment)
+    |                 |
+    |                 v
+    |               Apply -> verify -> save -> leave routers running
     |
-    v
-VERIFY: exact BGP peer/ASN state, active BGP routes, loopback-to-loopback pings
-    |
-    v
-CLEANUP: destroy this run's lab on success or failure
+    +-- manual opt-in on main -> temporary Containerlab deployment
+                              |
+                              v
+                            Apply -> verify -> destroy temporary lab
 ```
 
+The existing-lab workflow downloads the exact successful build's configurations
+and checks out that build's commit. PRs and manual test-only runs do not update
+the persistent lab. Only a successful **push build on main** triggers its approval
+flow. The persistent deployment never creates or destroys containers.
+
 “Build” renders network configurations; it does not build or redistribute Arista's
-licensed container image. Pull requests never deploy to the privileged runner.
+licensed container image. Pull requests never deploy through these workflows.
+
+## Deployment modes
+
+| Mode | Trigger | Runner label | Result |
+| --- | --- | --- | --- |
+| Existing lab | Successful main push build, then approval | `existing-lab` | Update and keep existing routers |
+| Temporary lab | Manual run with `deploy_temporary_lab` checked | `containerlab` | Create, test and destroy a lab |
+
+Both deployment jobs share a repository-wide concurrency group and do not cancel
+an in-progress deployment. They are not a FIFO queue; a superseded pending job
+can be replaced by a newer one. Do not run the temporary deployment on a host
+already using its management subnet for a persistent lab.
 
 ## Topology
 
@@ -46,7 +67,9 @@ Management addresses are `172.31.250.11` through `.14`.
 | [inventory/groups.yaml](inventory/groups.yaml) | NAPALM EOS/SSH connection settings |
 | [templates/eos.j2](templates/eos.j2) | Strict Jinja2 configuration template |
 | [lab/](lab/) | Validation, Nornir rendering, deployment tasks and live assertions |
-| [.github/workflows/lab.yml](.github/workflows/lab.yml) | Test -> build -> ephemeral integration lab |
+| [.github/workflows/lab.yml](.github/workflows/lab.yml) | Automatic test/build; opt-in temporary lab |
+| [.github/workflows/deploy-existing.yml](.github/workflows/deploy-existing.yml) | Approved deployment of tested artifacts to existing routers |
+| [lab/deployment_guard.py](lab/deployment_guard.py) | Reject untrusted/stale builds and missing reviewer protection |
 | [scripts/run-lab.sh](scripts/run-lab.sh) | Local/CI lifecycle with cleanup trap |
 
 ## 1. Run offline checks
@@ -83,6 +106,17 @@ Re-run all offline checks before committing a refreshed lock.
 
 ## 2. Prepare a dedicated runner
 
+For **existing-lab deployment only**, use a trusted Linux x86-64 runner with
+Python support and SSH connectivity to every management IP in the inventory.
+Register it with labels `self-hosted`, `linux`, `x64`, and **`existing-lab`**.
+This workflow needs no Docker socket, Containerlab installation, or sudo access;
+the routers must already be running. A runner on their Docker host can reach
+them directly; a remote runner needs a route to their management network.
+Use a separate runner work directory: checkout cleans its workspace, so never
+store the live Containerlab files there.
+
+The steps below apply to a runner that will also **create temporary labs**:
+
 Do this on a **disposable, isolated Linux x86-64 runner**, not a shared machine or
 a production network host:
 
@@ -112,8 +146,10 @@ Docker access and Containerlab privileges are effectively root access. Restrict
 this runner to trusted repositories and maintainers; do **not** attach it to a
 public repository that accepts untrusted workflow jobs. A job's `if` condition
 alone cannot protect a runner from malicious changes to a PR's workflow.
-Rebuild disposable runners regularly. The runner must not host other labs using
-this subnet; concurrency is serialized within this repository only.
+Rebuild disposable runners regularly. The temporary-lab runner must not host
+other labs using this subnet; concurrency is serialized within this repository
+only. Restrict persistent-lab runners too: network access and device credentials
+are sensitive even without Docker privileges.
 
 Containerlab's default cEOS bootstrap uses the lab-only `admin` account and its
 documented default password. Supply those values through GitHub's environment
@@ -126,19 +162,57 @@ isolated; no host ports are published by this topology.
 
 1. Push this project to your own trusted/private GitHub repository with `main`
    as the default branch. No remote repository is created automatically.
-2. Create the GitHub environment **`containerlab`**:
-   - Variable `LAB_USERNAME`: the bootstrap username.
-   - Secret `LAB_PASSWORD`: the bootstrap password.
-   - Restrict deployment branches to `main`; add required reviewers where
-     supported by your GitHub plan.
+2. In **Settings -> Environments**, create **`existing-lab`**:
+   - Enable **Required reviewers** and choose at least one reviewer.
+   - Variable `LAB_USERNAME`: the running devices' username.
+   - Secret `LAB_PASSWORD`: the running devices' password.
+   - Restrict deployment branches to `main`.
+   - Disable administrator bypass where available. Enable prevention of
+     self-review if a different person must approve deployments.
 3. Protect `main` and require the `test` and `build` jobs before merging.
-4. Open a PR to run offline CI. Merge to `main` (or use **Run workflow** on
-   `main`) to deploy and test the temporary lab.
+4. Open a PR to run offline CI. Merge to `main`: once **Network lab CI/CD**
+   succeeds, **Deploy to existing lab** starts its guard job.
+5. Open **Deploy to existing lab -> Review deployments**, review the source
+   commit and its `device-configs` artifact, select `existing-lab`, and approve.
+   The runner applies, verifies, saves, and leaves your lab running.
 
-The deploy job downloads exactly the configuration artifact produced by its
-build job and verifies every checksum **before** modifying any device.
-It uses a unique lab/network name for each run/attempt. Credentials are never
-included in rendered configurations or uploaded as artifacts.
+**Approval is not enabled just by committing the workflow.** Required reviewers
+must be configured in GitHub. The guard reads the environment settings and fails
+closed if the environment is missing, inaccessible, or has no required reviewers.
+If your plan does not support required reviewers for this repository's visibility,
+deployment is blocked rather than silently bypassing approval. GitHub currently
+restricts private-repository required-reviewer rules to Enterprise plans; see
+[environment availability](https://docs.github.com/en/rest/deployments/environments).
+Do not expose a shared privileged runner publicly merely to obtain that feature.
+
+Keep both workflow files on the default branch. The existing-lab workflow uses
+`workflow_run`, accepts only successful same-repository main **push** builds,
+and downloads `device-configs` by that run's ID (not a floating "latest" artifact).
+It checks out the corresponding SHA and validates checksums before configuration.
+It rejects builds no longer at the main tip both before approval and again after
+approval, before contacting devices. It does not cancel changes already in flight.
+If a newer push supersedes an approval, approve that newer successful build.
+Approve within the artifact's seven-day retention period.
+
+To retry a failed deployment for the same current commit, use **Re-run failed
+jobs** in **Deploy to existing lab** and approve again if GitHub requests it.
+For a new candidate, push a new commit. A manual test-only CI run does not deploy
+to the existing lab.
+
+### Optional temporary-lab workflow
+
+Create a separate **`containerlab`** environment with `LAB_USERNAME` and
+`LAB_PASSWORD` for the default cEOS bootstrap, and restrict it to `main`.
+Under **Actions -> Network lab CI/CD -> Run workflow**, select `main` and check
+**deploy_temporary_lab**. Leaving it unchecked runs only test/build jobs.
+
+This opt-in deployment uses a unique lab/network name, downloads the current
+run's configuration artifact, and automatically cleans up afterward. It does
+not trigger an existing-lab deployment because its source event is manual,
+not a push. Credentials are never included in rendered configurations or
+uploaded as artifacts.
+
+### Verification and failure behavior
 
 Readiness polls NAPALM facts, not merely an open TCP port. Verification retries
 while BGP converges and requires, on every router:
@@ -150,10 +224,23 @@ while BGP converges and requires, on every router:
 
 Task failures produce nonzero exit statuses. Readiness and convergence have
 retry budgets; an in-flight driver call can extend these by its connection/
-command timeout. The GitHub job additionally has a 30-minute limit.
+command timeout. The existing-lab job has a 20-minute limit; the temporary-lab
+job has a 30-minute limit.
+
 NAPALM uses **merge**, preserving management access. This is not a production
-replacement/rollback workflow: partial configuration failure fails the job and
-the entire temporary lab is destroyed.
+replacement/rollback workflow. In existing-lab mode, a configuration or
+verification failure stops later steps and leaves the lab running for diagnosis;
+already-applied changes are not rolled back. The explicit `python -m lab save`
+step runs only after all verification passes and requires EOS to confirm
+`copy running-config startup-config` on every router.
+
+**Persistence caveat:** NAPALM's EOS `commit_config` already performs
+`write memory` during configuration. The post-verification save is an additional
+checked save, not a transactional persistence boundary. Even if verification
+fails, some configuration changes may already be saved. A save failure also
+fails the job, but saves completed on other routers remain.
+
+Temporary-lab mode instead destroys its temporary lab on success or failure.
 
 ## 4. Optional local integration run
 
@@ -228,11 +315,10 @@ python -m lab build
 
 Review [build/r1.cfg](build/r1.cfg). Commit the inventory, schema, template, tests,
 and documentation changes together. A PR runs the existing test/build jobs;
-merging to `main` or manually running the workflow on `main` also runs the
-temporary integration lab. No workflow changes are needed for prefix-list
-rendering. This workflow **does not update an already-running persistent lab**.
-Do not run its deployment alongside a persistent lab using `172.31.250.0/24` on
-the same host; use a separate runner or a non-overlapping topology/inventory.
+merging to `main` triggers the existing-lab approval flow after a successful
+build. No workflow changes are needed for subsequent prefix-list entries.
+Temporary deployment is manual opt-in only; do not run it alongside a
+persistent lab using `172.31.250.0/24` on the same host.
 
 For an existing lab only, after reviewing the build and exporting `LAB_USERNAME`
 and `LAB_PASSWORD`, use:
@@ -240,13 +326,13 @@ and `LAB_PASSWORD`, use:
 ```bash
 python -m lab wait --timeout 120 &&
 python -m lab configure &&
-python -m lab verify --timeout 180
+python -m lab verify --timeout 180 &&
+python -m lab save
 ```
 
 This updates all inventory routers without creating or destroying containers.
-It does not invoke the automatic-cleanup lifecycle script. Save the running
-configuration on each changed router after verifying it if restart persistence
-is required.
+It does not invoke the automatic-cleanup lifecycle script. These local commands
+do not use GitHub's approval gate; use the workflow for reviewed deployments.
 
 Offline tests check rule rendering and validation. Live verification still
 checks baseline BGP sessions, loopback routes and pings; it does not prove every
@@ -260,6 +346,15 @@ not policy reconciliation. For deletions or changes to existing rules, use a
 fresh CI lab or explicitly remove the obsolete device commands first.
 
 ## Cleanup and troubleshooting
+
+**Existing lab:** inspect the **Deploy to existing lab** job and its
+`existing-lab-results-*` artifact for readiness, configuration, verification, and
+save logs. There is no cleanup step. If the guard fails, check required reviewers,
+token read access and whether the source SHA is still the main tip. If the deploy
+job is queued, check approval status and the runner's `existing-lab` label.
+Do not destroy your persistent lab to retry a configuration deployment.
+
+**Temporary lab only:**
 
 The shell EXIT/INT/TERM traps perform cleanup; an `always()` workflow step retries
 it if necessary. Cleanup targets only the generated topology and checks that its

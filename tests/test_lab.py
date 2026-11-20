@@ -19,6 +19,7 @@ from lab.automation import (
     prepare,
     require_success,
     retry,
+    save_host,
     verify_host,
 )
 from lab.model import load_hosts, read_yaml, validate_topology
@@ -262,6 +263,48 @@ def test_configure_errors_fail_the_run(tmp_path, monkeypatch):
     monkeypatch.setattr("lab.automation.napalm_configure", reject)
     with pytest.raises(RuntimeError, match="failed on"):
         live(ROOT, tmp_path, "configure", 1)
+
+
+@pytest.mark.parametrize("failure", [False, True])
+def test_save_runs_on_all_hosts_and_propagates_failure(tmp_path, monkeypatch, failure):
+    monkeypatch.setenv("LAB_USERNAME", "test-user")
+    monkeypatch.setenv("LAB_PASSWORD", "test-value")
+    seen = set()
+
+    def save(task):
+        seen.add(task.host.name)
+        device = Mock()
+        device.cli.return_value = {
+            "copy running-config startup-config": (
+                "% Error writing startup-config"
+                if failure and task.host.name == "r1"
+                else "Copy completed successfully.\n"
+            )
+        }
+        proxy = Mock()
+        proxy.host.name = task.host.name
+        proxy.host.get_connection.return_value = device
+        result = save_host(proxy)
+        device.cli.assert_called_once_with(["copy running-config startup-config"])
+        assert result.changed
+        return Result(host=task.host)
+
+    monkeypatch.setattr("lab.automation.save_host", save)
+    if failure:
+        with pytest.raises(RuntimeError, match="failed on r1"):
+            live(ROOT, tmp_path, "save", 1)
+    else:
+        live(ROOT, tmp_path, "save", 1)
+    assert seen == set(load_hosts(ROOT))
+
+
+@pytest.mark.parametrize("reply", [{}, {"copy running-config startup-config": ""}])
+def test_save_rejects_missing_confirmation(reply):
+    task = Mock()
+    task.host.name = "r1"
+    task.host.get_connection.return_value.cli.return_value = reply
+    with pytest.raises(RuntimeError, match="save was not confirmed"):
+        save_host(task)
 
 
 def test_live_requires_credentials(monkeypatch):

@@ -1,0 +1,97 @@
+name: Deploy to existing lab
+
+on:
+  workflow_run:
+    workflows: ["Network lab CI/CD"]
+    types: [completed]
+    branches: [main]
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  guard:
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_branch == 'main' &&
+      github.event.workflow_run.head_repository.full_name == github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - name: Require a current build and configured approval gate
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python -m lab.deployment_guard
+
+  deploy:
+    needs: guard
+    runs-on: [self-hosted, linux, x64, existing-lab]
+    environment: existing-lab
+    concurrency:
+      group: containerlab-${{ github.repository }}
+      cancel-in-progress: false
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - name: Install the tested automation
+        run: |
+          python -m venv .venv
+          .venv/bin/python -m pip install -r requirements.lock
+          .venv/bin/python -m pip install --no-deps -e .
+          echo "$GITHUB_WORKSPACE/.venv/bin" >> "$GITHUB_PATH"
+      - name: Download configurations from the exact successful build
+        uses: actions/download-artifact@v4
+        with:
+          name: device-configs
+          path: build
+          github-token: ${{ github.token }}
+          run-id: ${{ github.event.workflow_run.id }}
+      - name: Reject a superseded build after approval
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python -m lab.deployment_guard
+      - name: Wait for the existing routers
+        env:
+          LAB_USERNAME: ${{ vars.LAB_USERNAME }}
+          LAB_PASSWORD: ${{ secrets.LAB_PASSWORD }}
+        run: python -m lab wait --timeout 300 2>&1 | tee build/readiness.log
+      - name: Apply the checked configuration artifact
+        env:
+          LAB_USERNAME: ${{ vars.LAB_USERNAME }}
+          LAB_PASSWORD: ${{ secrets.LAB_PASSWORD }}
+        run: python -m lab configure 2>&1 | tee build/configure.log
+      - name: Verify BGP routes and loopback connectivity
+        env:
+          LAB_USERNAME: ${{ vars.LAB_USERNAME }}
+          LAB_PASSWORD: ${{ secrets.LAB_PASSWORD }}
+        run: python -m lab verify --timeout 180 2>&1 | tee build/verify.log
+      - name: Save verified running configurations
+        env:
+          LAB_USERNAME: ${{ vars.LAB_USERNAME }}
+          LAB_PASSWORD: ${{ secrets.LAB_PASSWORD }}
+        run: python -m lab save 2>&1 | tee build/save.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: existing-lab-results-${{ github.run_id }}-${{ github.run_attempt }}
+          path: build/*.log
+          if-no-files-found: warn
+          retention-days: 7

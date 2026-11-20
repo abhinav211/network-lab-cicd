@@ -158,6 +158,16 @@ def verify_host(task: Task, hosts: dict[str, Host]) -> Result:
     return Result(host=task.host)
 
 
+def save_host(task: Task) -> Result:
+    device = task.host.get_connection("napalm", task.nornir.config)
+    command = "copy running-config startup-config"
+    reply = device.cli([command])
+    if reply.get(command, "").strip() != "Copy completed successfully.":
+        raise RuntimeError(f"{task.host.name}: startup-config save was not confirmed: {reply}")
+    LOG.info("%s: running configuration saved to startup-config", task.host.name)
+    return Result(host=task.host, changed=True)
+
+
 def live(root: Path, output: Path, command: str, timeout: int) -> None:
     hosts = load_hosts(root)
     if command == "configure":
@@ -180,5 +190,7 @@ def live(root: Path, output: Path, command: str, timeout: int) -> None:
             require_success(nr.run(task=configure))
         elif command == "verify":
             retry(nr, partial(verify_host, hosts=hosts), timeout)
+        elif command == "save":
+            require_success(nr.run(task=save_host))
         else:
             raise ValueError(f"unknown live command: {command}")
