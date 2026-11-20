@@ -18,7 +18,8 @@ BUILD: Jinja2 -> one EOS configuration per host + SHA256SUMS artifact
     |               Required approval (existing-lab environment)
     |                 |
     |                 v
-    |               Apply -> verify -> save -> leave routers running
+    |               Read live state -> plan delta -> apply delta
+    |                 -> verify -> save changed routers -> leave running
     |
     +-- manual opt-in on main -> temporary Containerlab deployment
                               |
@@ -30,6 +31,9 @@ The existing-lab workflow downloads the exact successful build's configurations
 and checks out that build's commit. PRs and manual test-only runs do not update
 the persistent lab. Only a successful **push build on main** triggers its approval
 flow. The persistent deployment never creates or destroys containers.
+It reads current configuration and sends only differing managed commands,
+not the full rendered configuration. Unchanged routers receive no configuration
+candidate and no save command.
 
 “Build” renders network configurations; it does not build or redistribute Arista's
 licensed container image. Pull requests never deploy through these workflows.
@@ -70,6 +74,7 @@ Management addresses are `172.31.250.11` through `.14`.
 | [.github/workflows/lab.yml](.github/workflows/lab.yml) | Automatic test/build; opt-in temporary lab |
 | [.github/workflows/deploy-existing.yml](.github/workflows/deploy-existing.yml) | Approved deployment of tested artifacts to existing routers |
 | [lab/deployment_guard.py](lab/deployment_guard.py) | Reject untrusted/stale builds and missing reviewer protection |
+| [lab/incremental.py](lab/incremental.py) | Read live state, plan minimal changes, reject stale plans and apply only differences |
 | [scripts/run-lab.sh](scripts/run-lab.sh) | Local/CI lifecycle with cleanup trap |
 
 ## 1. Run offline checks
@@ -174,7 +179,8 @@ isolated; no host ports are published by this topology.
    succeeds, **Deploy to existing lab** starts its guard job.
 5. Open **Deploy to existing lab -> Review deployments**, review the source
    commit and its `device-configs` artifact, select `existing-lab`, and approve.
-   The runner applies, verifies, saves, and leaves your lab running.
+   The runner reads live state, plans differences, applies only those differences,
+   verifies, saves changed routers, and leaves your lab running.
 
 **Approval is not enabled just by committing the workflow.** Required reviewers
 must be configured in GitHub. The guard reads the environment settings and fails
@@ -227,12 +233,14 @@ retry budgets; an in-flight driver call can extend these by its connection/
 command timeout. The existing-lab job has a 20-minute limit; the temporary-lab
 job has a 30-minute limit.
 
-NAPALM uses **merge**, preserving management access. This is not a production
-replacement/rollback workflow. In existing-lab mode, a configuration or
+NAPALM uses **merge**, preserving management access. Existing-lab mode sends only
+the delta; temporary-lab mode still sends the full rendered candidate to its
+fresh devices. This is not a production replacement/rollback workflow.
+In existing-lab mode, a configuration or
 verification failure stops later steps and leaves the lab running for diagnosis;
-already-applied changes are not rolled back. The explicit `python -m lab save`
+already-applied changes are not rolled back. The explicit `python -m lab save-diff`
 step runs only after all verification passes and requires EOS to confirm
-`copy running-config startup-config` on every router.
+`copy running-config startup-config` on each changed router.
 
 **Persistence caveat:** NAPALM's EOS `commit_config` already performs
 `write memory` during configuration. The post-verification save is an additional
@@ -241,6 +249,70 @@ fails, some configuration changes may already be saved. A save failure also
 fails the job, but saves completed on other routers remain.
 
 Temporary-lab mode instead destroys its temporary lab on success or failure.
+
+### Incremental configuration: current state versus desired state
+
+The build artifact remains the desired configuration. Before applying it, the
+existing-lab workflow reads NAPALM's full running configuration (including defaults,
+using EOS sanitization), parses its hierarchy, and compares template-managed
+fields. The SSH command-read timeout is 120 seconds to allow expanded running
+configuration reads on cEOS; connection timeouts remain separate. Indentation
+differences do not cause updates. For a description-only
+change on r1, the entire candidate sent to that router is:
+
+```text
+interface Ethernet1
+ description -to-r3
+exit
+```
+
+There are no IP, BGP or prefix-list commands in that candidate if those fields
+already match. If another desired field has drifted, it also appears in the plan:
+this is a **live-state diff**, not just a Git diff of the most recent commit.
+
+The generated `build/incremental-plan.json` records the target management address,
+current values of desired fields, desired configuration, delta commands, and
+fingerprints of running/desired state. Full running configurations are not written
+to disk or uploaded; unrelated configuration and secrets are excluded from the
+managed-state snapshot. Protect plan artifacts like your inventory.
+
+All hosts are checked before any writes. Apply recomputes the plan, rejects
+changed running state or modified artifacts, then rechecks each router immediately
+before its write. After applying, it reads state again and requires the managed
+fields to match the desired state. A fresh plan must show no changes on a
+converged lab. There is no cross-device transaction or lock against an external
+operator changing configuration during the final read/write interval.
+
+The workflow creates the plan **after** environment approval and applies it
+automatically. To inspect the exact live delta before any configuration writes,
+run these commands locally with `LAB_USERNAME` and `LAB_PASSWORD` already set:
+
+```bash
+python -m lab build &&
+python -m lab plan
+```
+
+Review the printed commands and `build/incremental-plan.json`. Only then run:
+
+```bash
+python -m lab apply-diff &&
+python -m lab verify --timeout 180 &&
+python -m lab save-diff
+```
+
+These local commands bypass GitHub approval. Do not run them concurrently with a
+workflow deployment. Regenerate and review the plan if apply reports stale state.
+The plan captures state anew every run; it does not trust a runner-local historical
+snapshot that could have become stale.
+
+**Scope:** only the commands supported by the current EOS template are planned.
+Unknown desired commands, incomplete running-state reads and changes to an
+existing BGP process ASN fail explicitly rather than falling back to a full push.
+Changing a prefix-list sequence removes that sequence and adds its new rule in
+the same candidate. Other rules are preserved. Removing fields, interfaces,
+neighbors or rules from the inventory does **not** delete them from a router.
+This preserves the existing additive ownership policy; explicit deletion
+reconciliation and topology provisioning are not implemented.
 
 ## 4. Optional local integration run
 
@@ -325,9 +397,15 @@ and `LAB_PASSWORD`, use:
 
 ```bash
 python -m lab wait --timeout 120 &&
-python -m lab configure &&
+python -m lab plan
+```
+
+Review the plan, then apply it:
+
+```bash
+python -m lab apply-diff &&
 python -m lab verify --timeout 180 &&
-python -m lab save
+python -m lab save-diff
 ```
 
 This updates all inventory routers without creating or destroying containers.
@@ -340,16 +418,18 @@ permit/deny rule. Inspect `show ip prefix-list` and
 `show ip bgp neighbors 10.10.13.1 advertised-routes` on r1, using known present
 routes to verify filtering. Blocking baseline loopbacks will fail live checks.
 
-**Merge limitation:** removing an entry or a neighbor attachment from YAML does
+**Ownership limitation:** removing an entry or a neighbor attachment from YAML does
 not remove the existing device configuration. This is additive configuration,
-not policy reconciliation. For deletions or changes to existing rules, use a
-fresh CI lab or explicitly remove the obsolete device commands first.
+not deletion reconciliation. Incremental deployment can replace a changed
+prefix-list sequence. For deletions, use a fresh CI lab or explicitly remove
+the obsolete device commands first.
 
 ## Cleanup and troubleshooting
 
 **Existing lab:** inspect the **Deploy to existing lab** job and its
-`existing-lab-results-*` artifact for readiness, configuration, verification, and
-save logs. There is no cleanup step. If the guard fails, check required reviewers,
+`existing-lab-results-*` artifact for readiness, plan, configuration, verification,
+save logs and the incremental state/plan JSON. There is no cleanup step.
+If the guard fails, check required reviewers,
 token read access and whether the source SHA is still the main tip. If the deploy
 job is queued, check approval status and the runner's `existing-lab` label.
 Do not destroy your persistent lab to retry a configuration deployment.

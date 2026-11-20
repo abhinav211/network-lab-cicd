@@ -14,7 +14,7 @@ r1:
             prefix: 10.100.1.0/24
     interfaces:
       - name: Ethernet1
-        description: link-to-r3
+        description: no-mon uplink-to-r3
         address: 10.10.13.0/31
     bgp:
       asn: 65001

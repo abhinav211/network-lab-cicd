@@ -9,3 +9,4 @@ eos:
           conn_timeout: 10
           auth_timeout: 10
           banner_timeout: 20
+          read_timeout_override: 120

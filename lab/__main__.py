@@ -3,13 +3,26 @@ import logging
 from pathlib import Path
 
 from lab.automation import build, live, prepare
+from lab.incremental import incremental
 from lab.model import load_hosts
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Build, configure and verify a cEOS BGP lab")
     parser.add_argument(
-        "command", choices=["validate", "build", "prepare", "wait", "configure", "verify", "save"]
+        "command",
+        choices=[
+            "validate",
+            "build",
+            "prepare",
+            "wait",
+            "configure",
+            "verify",
+            "save",
+            "plan",
+            "apply-diff",
+            "save-diff",
+        ],
     )
     parser.add_argument("--root", type=Path, default=Path.cwd())
     parser.add_argument("--output", type=Path, default=Path("build"))
@@ -29,6 +42,8 @@ def main() -> None:
         if not args.lab_name:
             parser.error("prepare requires --lab-name")
         prepare(root, output, args.lab_name)
+    elif args.command in ("plan", "apply-diff", "save-diff"):
+        incremental(root, output, args.command)
     else:
         live(root, output, args.command, args.timeout)
     logging.info("%s completed", args.command)

@@ -73,11 +73,16 @@ jobs:
           LAB_USERNAME: ${{ vars.LAB_USERNAME }}
           LAB_PASSWORD: ${{ secrets.LAB_PASSWORD }}
         run: python -m lab wait --timeout 300 2>&1 | tee build/readiness.log
-      - name: Apply the checked configuration artifact
+      - name: Plan only differences against live running state
         env:
           LAB_USERNAME: ${{ vars.LAB_USERNAME }}
           LAB_PASSWORD: ${{ secrets.LAB_PASSWORD }}
-        run: python -m lab configure 2>&1 | tee build/configure.log
+        run: python -m lab plan 2>&1 | tee build/plan.log
+      - name: Apply only planned differences and reject stale state
+        env:
+          LAB_USERNAME: ${{ vars.LAB_USERNAME }}
+          LAB_PASSWORD: ${{ secrets.LAB_PASSWORD }}
+        run: python -m lab apply-diff 2>&1 | tee build/configure.log
       - name: Verify BGP routes and loopback connectivity
         env:
           LAB_USERNAME: ${{ vars.LAB_USERNAME }}
@@ -87,11 +92,13 @@ jobs:
         env:
           LAB_USERNAME: ${{ vars.LAB_USERNAME }}
           LAB_PASSWORD: ${{ secrets.LAB_PASSWORD }}
-        run: python -m lab save 2>&1 | tee build/save.log
+        run: python -m lab save-diff 2>&1 | tee build/save.log
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: existing-lab-results-${{ github.run_id }}-${{ github.run_attempt }}
-          path: build/*.log
+          path: |
+            build/*.log
+            build/incremental-plan.json
           if-no-files-found: warn
           retention-days: 7
