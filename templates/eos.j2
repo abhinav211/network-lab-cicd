@@ -1,0 +1,30 @@
+ip routing
+!
+interface Loopback0
+ description BGP-router-id-and-test-prefix
+ ip address {{ loopback }}
+!
+{% for interface in interfaces %}
+interface {{ interface.name }}
+ description {{ interface.description }}
+ no switchport
+ ip address {{ interface.address }}
+ no shutdown
+!
+{% endfor %}
+{% for prefix_list in prefix_lists %}
+{% for entry in prefix_list.entries | sort(attribute='sequence') %}
+ip prefix-list {{ prefix_list.name }} seq {{ entry.sequence }} {{ entry.action }} {{ entry.prefix }}
+{% endfor %}
+!
+{% endfor %}
+router bgp {{ bgp.asn }}
+ router-id {{ router_id }}
+{% for neighbor in bgp.neighbors %}
+ neighbor {{ neighbor.address }} remote-as {{ neighbor.remote_as }}
+{% if neighbor.prefix_list_out %}
+ neighbor {{ neighbor.address }} prefix-list {{ neighbor.prefix_list_out }} out
+{% endif %}
+{% endfor %}
+ network {{ loopback }}
+!

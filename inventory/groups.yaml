@@ -1,0 +1,11 @@
+eos:
+  platform: eos
+  connection_options:
+    napalm:
+      extras:
+        timeout: 20
+        optional_args:
+          transport: ssh
+          conn_timeout: 10
+          auth_timeout: 10
+          banner_timeout: 20

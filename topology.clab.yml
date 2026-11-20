@@ -1,0 +1,25 @@
+name: bgp-ci
+mgmt:
+  network: bgp-ci
+  ipv4-subnet: 172.31.250.0/24
+topology:
+  kinds:
+    arista_ceos:
+      image: ceos:4.32.0F
+  nodes:
+    r1:
+      kind: arista_ceos
+      mgmt-ipv4: 172.31.250.11
+    r2:
+      kind: arista_ceos
+      mgmt-ipv4: 172.31.250.12
+    r3:
+      kind: arista_ceos
+      mgmt-ipv4: 172.31.250.13
+    r4:
+      kind: arista_ceos
+      mgmt-ipv4: 172.31.250.14
+  links:
+    - endpoints: ["r1:eth1", "r3:eth1"]
+    - endpoints: ["r2:eth1", "r3:eth2"]
+    - endpoints: ["r4:eth1", "r3:eth3"]

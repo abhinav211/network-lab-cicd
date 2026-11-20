@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "network-lab-cicd"
+version = "0.1.0"
+description = "An ephemeral cEOS BGP lab tested with Nornir and NAPALM"
+requires-python = ">=3.11"
+dependencies = [
+  "Jinja2>=3.1.6,<4",
+  "napalm>=5.1,<6",
+  "nornir>=3.5,<4",
+  "nornir-napalm>=0.5,<1",
+  "pydantic>=2.10,<3",
+  "PyYAML>=6.0.2,<7",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8,<10", "ruff>=0.14,<1", "mypy>=1.18,<2", "types-PyYAML>=6,<7"]
+
+[tool.setuptools]
+packages = ["lab"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.mypy]
+python_version = "3.11"
+files = ["lab"]
+check_untyped_defs = true
+disallow_untyped_defs = true
+
+[[tool.mypy.overrides]]
+module = ["napalm.*", "nornir_napalm.*"]
+ignore_missing_imports = true

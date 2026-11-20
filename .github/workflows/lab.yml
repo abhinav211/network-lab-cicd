@@ -1,0 +1,106 @@
+name: Network lab CI/CD
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+          cache: pip
+          cache-dependency-path: requirements.lock
+      - run: |
+          python -m pip install -r requirements.lock
+          python -m pip install --no-deps -e .
+      - name: Lint, type-check, and test
+        run: |
+          ruff check .
+          ruff format --check .
+          mypy
+          pytest -q --junitxml=build/unit-tests.xml
+          python -m lab validate
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: unit-test-results
+          path: build/unit-tests.xml
+          if-no-files-found: warn
+
+  build:
+    needs: test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+          cache: pip
+          cache-dependency-path: requirements.lock
+      - run: |
+          python -m pip install -r requirements.lock
+          python -m pip install --no-deps -e .
+      - name: Render immutable configuration artifact
+        run: python -m lab build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: device-configs
+          path: |
+            build/*.cfg
+            build/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 7
+
+  lab:
+    needs: build
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: [self-hosted, linux, x64, containerlab]
+    environment: containerlab
+    concurrency:
+      group: containerlab-${{ github.repository }}
+      cancel-in-progress: false
+    timeout-minutes: 30
+    env:
+      LAB_NAME: netci-${{ github.run_id }}-${{ github.run_attempt }}
+      LAB_USERNAME: ${{ vars.LAB_USERNAME }}
+      LAB_PASSWORD: ${{ secrets.LAB_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - name: Install automation in a job-local environment
+        run: |
+          python -m venv .venv
+          .venv/bin/python -m pip install -r requirements.lock
+          .venv/bin/python -m pip install --no-deps -e .
+          echo "$GITHUB_WORKSPACE/.venv/bin" >> "$GITHUB_PATH"
+      - uses: actions/download-artifact@v4
+        with:
+          name: device-configs
+          path: build
+      - name: Deploy, configure, verify, and tear down
+        run: bash scripts/run-lab.sh
+      - name: Retry cleanup after failure or cancellation
+        if: always()
+        run: bash scripts/cleanup-lab.sh
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: lab-results-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            build/*.log
+            build/runtime.clab.yml
+          if-no-files-found: warn
+          retention-days: 7
